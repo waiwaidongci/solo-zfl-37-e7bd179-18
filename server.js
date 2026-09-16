@@ -1,5 +1,5 @@
 import http from "node:http";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -133,11 +133,33 @@ function addMonths(dateStr, months) {
   return d.toISOString().slice(0, 10);
 }
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await saveDb(seed);
+// 原子写盘：唯一临时文件 + rename，失败时清理临时文件，原文件保持完整
+let tmpCounter = 0;
+async function writeAtomic(filePath, text) {
+  const tmp = filePath + "." + process.pid + "." + (tmpCounter++) + ".tmp";
+  try {
+    await writeFile(tmp, text);
+    await rename(tmp, filePath);
+  } catch (error) {
+    await unlink(tmp).catch(() => {});
+    throw error;
   }
+}
+// 空库初始化单例：并发首访共享同一次初始化，失败时复位允许下次重试
+let initPromise = null;
+function ensureDbFile() {
+  if (!initPromise) {
+    initPromise = (async () => {
+      if (!existsSync(dbPath)) {
+        await mkdir(dirname(dbPath), { recursive: true });
+        await writeAtomic(dbPath, JSON.stringify(seed, null, 2));
+      }
+    })().catch(error => { initPromise = null; throw error; });
+  }
+  return initPromise;
+}
+async function loadDb() {
+  await ensureDbFile();
   const db = JSON.parse(await readFile(dbPath, "utf8"));
   db.items ||= [];
   db.instruments ||= [];
@@ -146,12 +168,7 @@ async function loadDb() {
   db.requests ||= {};
   return db;
 }
-// 原子写盘：先写临时文件再 rename，失败时原文件保持完整，不会留下半条记录
-async function saveDb(db) {
-  const tmp = dbPath + ".tmp";
-  await writeFile(tmp, JSON.stringify(db, null, 2));
-  await rename(tmp, dbPath);
-}
+async function saveDb(db) { await writeAtomic(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -247,10 +264,19 @@ function traceChain(db, standardId, today) {
   }
 }
 
+// 最新校准按校准日期选择（并列时取后录入者），与数组顺序无关，补录旧日期不会覆盖当前状态
+function latestCalibration(calibrations) {
+  let best = null, bestIdx = -1;
+  (calibrations || []).forEach((c, i) => {
+    const at = c.at || "";
+    if (!best || at > (best.at || "") || (at === (best.at || "") && i > bestIdx)) { best = c; bestIdx = i; }
+  });
+  return best;
+}
+
 // 仪器可用性：停用、未校准、超差、过期、溯源链断裂均不可用于试磨结论
 function instrumentState(db, instrument, today) {
-  const calibrations = instrument.calibrations || [];
-  const latest = calibrations[calibrations.length - 1] || null;
+  const latest = latestCalibration(instrument.calibrations);
   const state = { latest, validUntil: latest ? latest.validUntil : null, reasons: [], chain: null, combinedUncertainty: null, correction: 0, usable: false };
   if (instrument.status === "停用") state.reasons.push("已停用");
   if (!latest) {
@@ -308,25 +334,41 @@ function recordCalibration(db, instrument, input) {
   let impact = null;
   let marked = 0;
   if (result === "超差") {
-    const previous = instrument.calibrations[instrument.calibrations.length - 2];
-    const since = previous ? previous.at : "";
+    // 影响窗口按校准日期定位：[上一次校准日期, 下一次校准日期)，补录旧日期时不会错误波及其余记录
+    const others = instrument.calibrations.filter(c => c !== calibration);
+    const earlier = others.map(c => c.at || "").filter(d => d < at).sort();
+    const later = others.map(c => c.at || "").filter(d => d > at).sort();
+    const since = earlier.length ? earlier[earlier.length - 1] : "";
+    const until = later.length ? later[0] : "";
     const tests = [];
     eachTest(db, (item, test) => {
       if (test.instrumentId !== instrument.id && test.instrumentId !== instrument.code) return;
       if (test.reviewStatus === "已复核") return;
       if (since && (test.at || "") < since) return;
+      if (until && (test.at || "") >= until) return;
       if (test.reviewStatus !== "待复核") { test.reviewStatus = "待复核"; marked += 1; }
       tests.push({ testId: test.id || null, itemId: item.id || item.code, itemCode: item.code, at: test.at, rawScore: test.rawScore ?? test.score, score: test.score });
       item.logs ||= [];
       item.logs.push({ at: nowIso(), step: "待复核", note: "仪器" + instrument.code + "校准超差，该试磨记录待复核" });
     });
     if (tests.length) {
-      impact = { id: uid("IMP"), at: nowIso(), instrumentId: instrument.id, instrumentCode: instrument.code, cause: "校准超差", calibrationId: calibration.id, since: since || null, tests, status: "待复核" };
+      impact = { id: uid("IMP"), at: nowIso(), instrumentId: instrument.id, instrumentCode: instrument.code, cause: "校准超差", calibrationId: calibration.id, since: since || null, until: until || null, tests, status: "待复核" };
       db.impacts.push(impact);
       instrument.logs.push({ at: nowIso(), step: "失准", note: "校准超差，" + tests.length + "条试磨记录标为待复核" });
     }
   }
   return { calibration, impact, marked, chainOk: traced.ok, chainReason: traced.reason || null };
+}
+
+// 整锭状态由全部当前有效记录中最新一条的评分决定，不被较早记录的重算覆盖
+function recomputeItemStatus(item) {
+  const tests = item.tests || [];
+  if (!tests.length) return;
+  let latest = tests[0];
+  for (const test of tests) {
+    if ((test.at || "") >= (latest.at || "")) latest = test;
+  }
+  item.status = latest.score >= 85 ? "已试磨" : "重点观察";
 }
 
 // 复核：复校合格后按原值重算受影响试磨记录，保留前后版本
@@ -339,6 +381,7 @@ function reviewInstrument(db, instrument) {
   const correction = state.correction;
   const now = nowIso();
   const recalculated = [];
+  const touchedItems = new Set();
   eachTest(db, (item, test) => {
     if (test.instrumentId !== instrument.id && test.instrumentId !== instrument.code) return;
     if (test.reviewStatus !== "待复核") return;
@@ -350,11 +393,12 @@ function reviewInstrument(db, instrument) {
     test.correction = correction;
     test.reviewStatus = "已复核";
     test.reviewedAt = now;
-    item.status = after >= 85 ? "已试磨" : "重点观察";
+    touchedItems.add(item);
     item.logs ||= [];
     item.logs.push({ at: now, step: "复核", note: "仪器" + instrument.code + "复校后按原值" + (test.rawScore ?? before) + "重算：评分" + before + "→" + after, score: after });
     recalculated.push({ testId: test.id || null, itemId: item.id || item.code, itemCode: item.code, before, after });
   });
+  for (const item of touchedItems) recomputeItemStatus(item);
   for (const impact of db.impacts) {
     if (impact.instrumentId === instrument.id && impact.status === "待复核") {
       impact.status = "已复核";
@@ -775,7 +819,7 @@ const server = http.createServer(async (req, res) => {
           item.logs.push({ at: now, step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
         }
         item.tests.push(test);
-        item.status = test.score >= 85 ? "已试磨" : "重点观察";
+        recomputeItemStatus(item);
         return { status: 201, body: item };
       });
     }
