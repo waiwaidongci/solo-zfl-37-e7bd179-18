@@ -129,7 +129,10 @@ const clampScore = n => Math.min(100, Math.max(0, round1(n)));
 function addMonths(dateStr, months) {
   const d = new Date(dateStr + "T00:00:00Z");
   if (Number.isNaN(d.getTime())) return dateStr;
+  const day = d.getUTCDate();
   d.setUTCMonth(d.getUTCMonth() + Number(months || 0));
+  // 月末加月溢出到下一月时，回落到目标月最后一天
+  if (d.getUTCDate() !== day) d.setUTCDate(0);
   return d.toISOString().slice(0, 10);
 }
 
@@ -237,20 +240,26 @@ function eachTest(db, fn) {
   }
 }
 
-// 沿标准器逐级上溯到上级基准，校验溯源链并合成链上不确定度（方和根）
+// 沿标准器逐级上溯到上级基准，校验溯源链并合成链上不确定度（方和根）；
+// 整条链的测量参数必须一致，跨物理量的链判为断裂
 function traceChain(db, standardId, today) {
   const chain = [];
   const seen = new Set();
   let current = findStandard(db, standardId);
   if (!current) return { ok: false, reason: "标准器不存在", chain };
   let sumSquares = 0;
+  let previous = null;
   while (current) {
     if (seen.has(current.id)) return { ok: false, reason: "溯源链存在循环", chain };
     seen.add(current.id);
     const expired = !!(current.validUntil && current.validUntil < today);
     chain.push({ ...current, expired });
     if (expired) return { ok: false, reason: "标准器" + current.code + "证书已过期", chain };
+    if (previous && previous.parameter && current.parameter && previous.parameter !== current.parameter) {
+      return { ok: false, reason: "溯源链参数不一致：" + previous.code + "（" + previous.parameter + "）与" + current.code + "（" + current.parameter + "）", chain };
+    }
     sumSquares += Number(current.uncertainty || 0) ** 2;
+    previous = current;
     if (current.parentId) {
       const parent = findStandard(db, current.parentId);
       if (!parent) return { ok: false, reason: "标准器" + current.code + "的上级标准器缺失", chain };
@@ -264,11 +273,13 @@ function traceChain(db, standardId, today) {
   }
 }
 
-// 最新校准按校准日期选择（并列时取后录入者），与数组顺序无关，补录旧日期不会覆盖当前状态
-function latestCalibration(calibrations) {
+// 最新校准按校准日期选择（并列时取后录入者），与数组顺序无关，补录旧日期不会覆盖当前状态；
+// 未来日期的校准不作为当前有效证据
+function latestCalibration(calibrations, today) {
   let best = null, bestIdx = -1;
   (calibrations || []).forEach((c, i) => {
     const at = c.at || "";
+    if (today && at > today) return;
     if (!best || at > (best.at || "") || (at === (best.at || "") && i > bestIdx)) { best = c; bestIdx = i; }
   });
   return best;
@@ -276,7 +287,7 @@ function latestCalibration(calibrations) {
 
 // 仪器可用性：停用、未校准、超差、过期、溯源链断裂均不可用于试磨结论
 function instrumentState(db, instrument, today) {
-  const latest = latestCalibration(instrument.calibrations);
+  const latest = latestCalibration(instrument.calibrations, today);
   const state = { latest, validUntil: latest ? latest.validUntil : null, reasons: [], chain: null, combinedUncertainty: null, correction: 0, usable: false };
   if (instrument.status === "停用") state.reasons.push("已停用");
   if (!latest) {
@@ -311,6 +322,7 @@ function recordCalibration(db, instrument, input) {
   }
   const today = todayStr();
   const at = input.at || today;
+  if (at > today) throw new HttpError(400, "校准日期不能晚于当天");
   const validUntil = input.validUntil || addMonths(at, instrument.cycleMonths || 12);
   const traced = traceChain(db, standard.id, today);
   const calibration = {
@@ -651,7 +663,9 @@ function page() {
     function addMonthsStr(dateStr, months) {
       const d = new Date(dateStr + 'T00:00:00');
       if (isNaN(d)) return '';
+      const day = d.getDate();
       d.setMonth(d.getMonth() + Number(months || 0));
+      if (d.getDate() !== day) d.setDate(0);
       return d.toISOString().slice(0, 10);
     }
     function updateValidUntil() {
@@ -660,7 +674,9 @@ function page() {
       $('#calValidUntil').placeholder = ins && at ? '默认 ' + addMonthsStr(at, ins.cycleMonths) : '留空按周期推算';
     }
     function setCalDefaults() {
-      $('#calAt').value = new Date().toISOString().slice(0, 10);
+      const today = new Date().toISOString().slice(0, 10);
+      $('#calAt').value = today;
+      $('#calAt').max = today;
       updateValidUntil();
     }
     async function toggleInstrument(id, action, btn) {
@@ -848,6 +864,9 @@ const server = http.createServer(async (req, res) => {
           parent = findStandard(db, input.parentId);
           if (!parent) throw new HttpError(400, "上级标准器不存在");
           if (parent.code === input.code) throw new HttpError(400, "上级标准器不能是自身");
+          if (input.parameter && parent.parameter && input.parameter !== parent.parameter) {
+            throw new HttpError(400, "标准器测量参数（" + input.parameter + "）必须与上级标准器（" + parent.parameter + "）一致");
+          }
         }
         if (!parent && !input.refName) throw new HttpError(400, "标准器必须能追溯到上级基准：请选择上级标准器或填写上级基准名称");
         const standard = { id: uid("STD"), code: input.code, name: input.name, parameter: input.parameter || "", uncertainty, parentId: parent ? parent.id : null, refName: parent ? "" : (input.refName || ""), refUncertainty: parent ? 0 : Number(input.refUncertainty || 0), validUntil: input.validUntil || "", certificateNo: input.certificateNo || "" };

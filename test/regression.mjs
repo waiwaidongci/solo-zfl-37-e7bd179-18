@@ -265,6 +265,75 @@ try {
     assert.equal(it.status, "重点观察", "整锭状态必须由更晚的低分记录决定，不能被改高");
   });
 
+  // ---------- 缺陷4：未来日期的校准不能作为当前有效证据 ----------
+  await test("未来日期的校准被拒绝且不影响仪器状态", async () => {
+    const before = await instrument("INS-001");
+    const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+    const r = await post("/api/instruments/INS-BALANCE/calibrations", { result: "超差", error: 9, uncertainty: 0.01, standardId: "STD-WORK", at: tomorrow });
+    assert.equal(r.status, 400);
+    assert.ok(r.body.error.includes("当天"), "应提示不能晚于当天: " + r.body.error);
+    const after = await instrument("INS-001");
+    assert.equal(after.calibrations.length, before.calibrations.length, "被拒绝的校准不应入账");
+    assert.equal(after.latest.at, before.latest.at, "最新状态不应变化");
+    assert.equal(after.usable, before.usable, "可用性不应变化");
+  });
+  await test("库中已存在的未来日期校准不作为当前有效证据", async () => {
+    const db = readDb();
+    const ins = db.instruments.find(i => i.id === "INS-BALANCE");
+    const future = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+    ins.calibrations.push({ id: "CAL-FUTURE", at: future, kind: "校准", result: "超差", error: 9, correction: -9, uncertainty: 0.01, standardId: "STD-WORK", standardCode: "STD-002", validUntil: "2099-01-01", chainOk: true, combinedUncertainty: 0.01 });
+    writeFileSync(dbPath, JSON.stringify(db, null, 2));
+    const got = await instrument("INS-001");
+    assert.notEqual(got.latest.at, future, "未来校准不应成为最新状态");
+    assert.equal(got.usable, true, "未来的超差记录不影响当前可用性");
+    const restored = readDb();
+    const list = restored.instruments.find(i => i.id === "INS-BALANCE");
+    list.calibrations = list.calibrations.filter(c => c.id !== "CAL-FUTURE");
+    writeFileSync(dbPath, JSON.stringify(restored, null, 2));
+    assert.equal((await instrument("INS-001")).usable, true);
+  });
+
+  // ---------- 缺陷5：月末加月回落到目标月最后一天 ----------
+  await test("校准周期从月末加月回落到目标月最后一天", async () => {
+    const ins1 = (await post("/api/instruments", { code: "INS-EOM", name: "月末仪", parameter: "质量", cycleMonths: 1 })).body;
+    const r1 = await post(`/api/instruments/${ins1.id}/calibrations`, { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2026-01-31" });
+    assert.equal(r1.body.calibration.validUntil, "2026-02-28", "1月31日+1月应落在2月28日");
+    const r2 = await post(`/api/instruments/${ins1.id}/calibrations`, { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2024-01-31" });
+    assert.equal(r2.body.calibration.validUntil, "2024-02-29", "闰年应落在2月29日");
+    const ins3 = (await post("/api/instruments", { code: "INS-EOM3", name: "季末仪", parameter: "质量", cycleMonths: 3 })).body;
+    const r3 = await post(`/api/instruments/${ins3.id}/calibrations`, { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2026-01-31" });
+    assert.equal(r3.body.calibration.validUntil, "2026-04-30", "1月31日+3月应落在4月30日");
+    const r4 = await post(`/api/instruments/${ins3.id}/calibrations`, { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2026-01-15" });
+    assert.equal(r4.body.calibration.validUntil, "2026-04-15", "非月末日期不受影响");
+  });
+
+  // ---------- 缺陷6：整条溯源链的测量参数必须一致 ----------
+  await test("登记标准器时参数与上级不一致被拒", async () => {
+    const created = await post("/api/standards", { code: "STD-LEN", name: "线纹尺", parameter: "长度", uncertainty: 0.001, refName: "国家长度基准", validUntil: "2028-01-01" });
+    assert.equal(created.status, 201);
+    const r = await post("/api/standards", { code: "STD-BADMIX", name: "错配砝码", parameter: "质量", uncertainty: 0.001, parentId: "STD-LEN" });
+    assert.equal(r.status, 400);
+    assert.ok(r.body.error.includes("一致"), "应提示参数必须一致: " + r.body.error);
+  });
+  await test("上级标准器测量不同物理量时整条链判为断裂", async () => {
+    // 创建入口已拦截，直接注入历史遗留的跨物理量链
+    const db = readDb();
+    db.standards.push(
+      { id: "STD-BAD-P", code: "STD-BAD-P", name: "长度基准尺", parameter: "长度", uncertainty: 0.001, parentId: null, refName: "国家长度基准", refUncertainty: 0.0005, validUntil: "2028-01-01", certificateNo: "X1" },
+      { id: "STD-BAD-C", code: "STD-BAD-C", name: "错配工作砝码", parameter: "质量", uncertainty: 0.002, parentId: "STD-BAD-P", refName: "", refUncertainty: 0, validUntil: "2028-01-01", certificateNo: "X2" }
+    );
+    writeFileSync(dbPath, JSON.stringify(db, null, 2));
+    const std = (await get("/api/standards")).body.find(s => s.code === "STD-BAD-C");
+    assert.equal(std.chainOk, false, "跨物理量的链应判为断裂");
+    assert.ok(std.chainReason.includes("参数不一致"), "应报告参数不一致: " + std.chainReason);
+    const ins = (await post("/api/instruments", { code: "INS-MIX", name: "错配仪", parameter: "质量", cycleMonths: 12 })).body;
+    await post(`/api/instruments/${ins.id}/calibrations`, { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-BAD-C", at: "2026-09-01" });
+    const got = await instrument("INS-MIX");
+    assert.equal(got.usable, false, "链断裂的仪器不可用于试磨结论");
+    assert.ok(got.reasons.includes("溯源链断裂"));
+    assert.equal(got.combinedUncertainty, null, "断链时无法合成不确定度");
+  });
+
   // ---------- 原子写盘：写失败不留半条记录 ----------
   await test("写盘失败返回500且不留半条仪器/证书/影响记录", async () => {
     const roDir = mkdtempSync(join(tmpdir(), "ink-ro-"));
