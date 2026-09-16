@@ -110,6 +110,13 @@ const stages = ["待试磨","已试磨","重点观察"];
 const statLabels = ["待试磨","已试磨","重点观察"];
 const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
 const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+// 不存在的日期（如2月30日）同样非法：构造后年月日必须原样返回
+function isValidDateStr(s) {
+  if (typeof s !== "string" || !dateRe.test(s)) return false;
+  const [y, m, d] = s.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
 
 class HttpError extends Error {
   constructor(status, message, extra) {
@@ -119,8 +126,14 @@ class HttpError extends Error {
   }
 }
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
-const nowIso = () => new Date().toISOString();
+// 业务时区默认 Asia/Shanghai（UTC+8，无夏令时），可用 BIZ_TZ_OFFSET_MINUTES 覆盖；
+// INK_FIXED_NOW 固定时钟仅供回归测试使用
+const bizOffsetMinutes = Number(process.env.BIZ_TZ_OFFSET_MINUTES ?? 480);
+const fixedNow = process.env.INK_FIXED_NOW ? Date.parse(process.env.INK_FIXED_NOW) : null;
+const nowMs = () => (fixedNow != null && !Number.isNaN(fixedNow) ? fixedNow : Date.now());
+const nowIso = () => new Date(nowMs()).toISOString();
+// “当天”按业务时区判断：上海凌晨时 UTC 仍是昨日，不能因此把本地当天误判为未来日期
+const todayStr = () => new Date(nowMs() + bizOffsetMinutes * 60000).toISOString().slice(0, 10);
 const uid = prefix => prefix + "-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 const round1 = n => Number(n.toFixed(1));
 const round4 = n => Number(n.toFixed(4));
@@ -313,8 +326,8 @@ function recordCalibration(db, instrument, input) {
   const uncertainty = Number(input.uncertainty);
   if (!Number.isFinite(error)) throw new HttpError(400, "示值误差必须为数字");
   if (!Number.isFinite(uncertainty) || uncertainty < 0) throw new HttpError(400, "不确定度必须为不小于0的数字");
-  if (input.at && !dateRe.test(input.at)) throw new HttpError(400, "校准日期格式应为 YYYY-MM-DD");
-  if (input.validUntil && !dateRe.test(input.validUntil)) throw new HttpError(400, "有效期格式应为 YYYY-MM-DD");
+  if (input.at && !isValidDateStr(input.at)) throw new HttpError(400, "校准日期不存在或格式错误");
+  if (input.validUntil && !isValidDateStr(input.validUntil)) throw new HttpError(400, "有效期不存在或格式错误");
   const standard = findStandard(db, input.standardId);
   if (!standard) throw new HttpError(400, "标准器不存在");
   if (instrument.parameter && standard.parameter && instrument.parameter !== standard.parameter) {
@@ -660,13 +673,21 @@ function page() {
         : '<option disabled>'+esc(i.code)+' · '+esc(i.name)+'（不可用：'+i.reasons.join('、')+'）</option>').join('');
       testSel.value = cur;
     }
+    function localTodayStr() {
+      const d = new Date();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      return d.getFullYear() + '-' + mm + '-' + dd;
+    }
     function addMonthsStr(dateStr, months) {
       const d = new Date(dateStr + 'T00:00:00');
       if (isNaN(d)) return '';
       const day = d.getDate();
       d.setMonth(d.getMonth() + Number(months || 0));
       if (d.getDate() !== day) d.setDate(0);
-      return d.toISOString().slice(0, 10);
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      return d.getFullYear() + '-' + mm + '-' + dd;
     }
     function updateValidUntil() {
       const ins = instruments.find(i => i.id === $('#calInstrument').value);
@@ -674,7 +695,7 @@ function page() {
       $('#calValidUntil').placeholder = ins && at ? '默认 ' + addMonthsStr(at, ins.cycleMonths) : '留空按周期推算';
     }
     function setCalDefaults() {
-      const today = new Date().toISOString().slice(0, 10);
+      const today = localTodayStr();
       $('#calAt').value = today;
       $('#calAt').max = today;
       updateValidUntil();
@@ -859,6 +880,7 @@ const server = http.createServer(async (req, res) => {
         if (db.standards.some(x => x.code === input.code)) throw new HttpError(409, "标准器编号已存在");
         const uncertainty = Number(input.uncertainty);
         if (!Number.isFinite(uncertainty) || uncertainty < 0) throw new HttpError(400, "不确定度必须为不小于0的数字");
+        if (input.validUntil && !isValidDateStr(input.validUntil)) throw new HttpError(400, "证书有效期不存在或格式错误");
         let parent = null;
         if (input.parentId) {
           parent = findStandard(db, input.parentId);

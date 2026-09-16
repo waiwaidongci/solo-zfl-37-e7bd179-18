@@ -1,6 +1,6 @@
 // 墨锭试磨室回归测试：node test/regression.mjs（或 npm test）
 // 独立临时库运行，不触碰 data/ink-stick-testing.json
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,9 +39,9 @@ const readDb = () => JSON.parse(readFileSync(dbPath, "utf8"));
 const instrument = async code => (await get("/api/instruments")).body.find(i => i.code === code);
 const item = async code => (await get("/api/items")).body.find(i => i.code === code);
 
-function startServer(port, db) {
+function startServer(port, db, extraEnv = {}) {
   const child = spawn(process.execPath, [serverPath], {
-    env: { ...process.env, PORT: String(port), DB_PATH: db },
+    env: { ...process.env, PORT: String(port), DB_PATH: db, ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"]
   });
   child.stderr.on("data", d => process.stderr.write(d));
@@ -332,6 +332,57 @@ try {
     assert.equal(got.usable, false, "链断裂的仪器不可用于试磨结论");
     assert.ok(got.reasons.includes("溯源链断裂"));
     assert.equal(got.combinedUncertainty, null, "断链时无法合成不确定度");
+  });
+
+  // ---------- 缺陷7：不存在的日期必须拒绝 ----------
+  await test("不存在的日期（如2月30日）必须拒绝", async () => {
+    for (const bad of ["2026-02-30", "2026-02-29", "2026-13-01", "2026-04-31", "2026-00-10"]) {
+      const r = await post("/api/instruments/INS-BALANCE/calibrations", { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: bad });
+      assert.equal(r.status, 400, bad + " 应被拒绝");
+      assert.ok(r.body.error.includes("不存在") || r.body.error.includes("格式"), bad + " 应提示日期非法: " + r.body.error);
+    }
+    const r2 = await post("/api/instruments/INS-BALANCE/calibrations", { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", validUntil: "2027-02-30" });
+    assert.equal(r2.status, 400, "有效期也不允许不存在的日期");
+    const r3 = await post("/api/standards", { code: "STD-BADDATE", name: "错期砝码", uncertainty: 0.001, refName: "x", validUntil: "2027-02-30" });
+    assert.equal(r3.status, 400, "标准器证书有效期同样校验");
+    const ok = await post("/api/instruments/INS-BALANCE/calibrations", { result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2024-02-29" });
+    assert.equal(ok.status, 201, "闰年2月29日应合法");
+  });
+
+  // ---------- 缺陷8：当天按业务时区判断（固定时钟） ----------
+  await test("固定时钟：上海凌晨的本地当天不被误判为未来日期", async () => {
+    const tzDir = mkdtempSync(join(tmpdir(), "ink-tz-"));
+    const tzDb = join(tzDir, "db.json");
+    // UTC 2026-09-15 22:30 = 上海 2026-09-16 06:30
+    const srv = await startServer(PORT + 2, tzDb, { INK_FIXED_NOW: "2026-09-15T22:30:00.000Z" });
+    const postTz = data => fetch(`http://localhost:${PORT + 2}/api/instruments/INS-BALANCE/calibrations`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data)
+    }).then(r => r.status);
+    try {
+      assert.equal(await postTz({ result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2026-09-16" }), 201, "上海当地当天 2026-09-16 不应被拒");
+      assert.equal(await postTz({ result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2026-09-17" }), 400, "业务时区的明天仍是未来日期");
+      assert.equal(await postTz({ result: "合格", error: 0, uncertainty: 0.01, standardId: "STD-WORK", at: "2026-09-15" }), 201, "昨天可补录");
+      const ins = (await (await fetch(`http://localhost:${PORT + 2}/api/instruments`)).json()).find(i => i.id === "INS-BALANCE");
+      assert.equal(ins.latest.at, "2026-09-16", "业务当天的证书即为当前有效证据");
+      assert.equal(ins.usable, true);
+    } finally {
+      srv.kill();
+      rmSync(tzDir, { recursive: true, force: true });
+    }
+  });
+
+  // ---------- 缺陷9：页面与服务端月末加月结果一致 ----------
+  await test("页面与服务端月末加月结果一致（多浏览器时区）", async () => {
+    const html = await (await fetch(BASE + "/")).text();
+    const match = html.match(/function addMonthsStr[\s\S]*?\n    \}/);
+    assert.ok(match, "页面应包含 addMonthsStr");
+    const cases = [["2026-01-31", 1, "2026-02-28"], ["2024-01-31", 1, "2024-02-29"], ["2026-01-31", 3, "2026-04-30"], ["2026-10-31", 1, "2026-11-30"], ["2026-01-15", 1, "2026-02-15"], ["2026-12-31", 1, "2027-01-31"]];
+    for (const tz of ["Asia/Shanghai", "UTC", "America/New_York", "Pacific/Kiritimati"]) {
+      const out = execFileSync(process.execPath, ["-e",
+        `const addMonthsStr = ${match[0]};console.log(JSON.stringify(${JSON.stringify(cases.map(c => [c[0], c[1]]))}.map(([d, m]) => addMonthsStr(d, m))));`
+      ], { env: { ...process.env, TZ: tz } });
+      assert.deepEqual(JSON.parse(String(out)), cases.map(c => c[2]), tz + " 下页面加月结果应与服务端月末一致");
+    }
   });
 
   // ---------- 原子写盘：写失败不留半条记录 ----------
